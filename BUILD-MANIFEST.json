@@ -1,0 +1,6 @@
+{
+  "project": "ShopSphere Backend Engineering Curriculum",
+  "stack": "Java 21 / Spring Boot / PostgreSQL / Kafka",
+  "source_files_and_docs": 34,
+  "status": "Educational starter; see README and implementation spec for deliberate scope boundaries."
+}

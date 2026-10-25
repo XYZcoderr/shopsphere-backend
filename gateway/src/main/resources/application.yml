@@ -1,0 +1,30 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: shopsphere-gateway
+  cloud:
+    gateway:
+      routes:
+        - id: orders
+          uri: ${ORDER_SERVICE_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/orders/**
+        - id: inventory
+          uri: ${INVENTORY_SERVICE_URL:http://localhost:8082}
+          predicates:
+            - Path=/api/inventory/**
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${JWT_ISSUER_URI:}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+logging:
+  file:
+    name: ${GATEWAY_LOG_FILE:../logs/gateway.log}
+# Configure a trusted issuer to enable JWT validation. Do not expose an unprotected gateway publicly.

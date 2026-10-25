@@ -1,0 +1,16 @@
+### Inventory lookup
+GET http://localhost:8080/api/inventory/BK-001
+
+### Reserve one unit (direct inventory service)
+POST http://localhost:8082/api/inventory/BK-001/reserve?quantity=1
+
+### Create order
+POST http://localhost:8080/api/orders
+Content-Type: application/json
+Idempotency-Key: demo-order-001
+
+{
+  "customerId": "customer-123",
+  "sku": "BK-001",
+  "quantity": 1
+}

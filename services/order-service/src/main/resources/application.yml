@@ -1,0 +1,29 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/shopsphere}
+    username: ${DATABASE_USERNAME:shopsphere}
+    password: ${DATABASE_PASSWORD:local_dev_only}
+    hikari:
+      maximum-pool-size: 10
+  sql:
+    init:
+      mode: always
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+logging:
+  file:
+    name: ${ORDER_LOG_FILE:../../logs/order-service.log}

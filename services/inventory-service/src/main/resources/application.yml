@@ -1,0 +1,18 @@
+server:
+  port: 8082
+spring:
+  application:
+    name: inventory-service
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: inventory-service
+      auto-offset-reset: earliest
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+logging:
+  file:
+    name: ${INVENTORY_LOG_FILE:../../logs/inventory-service.log}

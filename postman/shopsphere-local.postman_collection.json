@@ -1,0 +1,322 @@
+{
+  "info": {
+    "_postman_id": "7db8902c-5510-46e6-8cef-1c2e37d6de7f",
+    "name": "ShopSphere Local API",
+    "description": "Step-by-step local checks for ShopSphere. Run requests in order: health checks, inventory examples, then create an order before fetching it. Each request gets an X-Correlation-ID that is forwarded by the gateway and printed in the gateway and service logs.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.environment.set('correlationId', pm.variables.replaceIn('{{$guid}}'));"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1 - Health checks",
+      "description": "Run all three requests first. Each should return HTTP 200 and {\"status\":\"UP\"} before you continue.",
+      "item": [
+        {
+          "name": "1.1 Gateway health",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{baseUrl}}/actuator/health",
+            "description": "Checks that the gateway process is accepting requests."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Gateway is healthy', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('UP');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.2 Order Service health",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{orderServiceUrl}}/actuator/health",
+            "description": "Checks the Order Service directly."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Order Service is healthy', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('UP');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.3 Inventory Service health",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{inventoryServiceUrl}}/actuator/health",
+            "description": "Checks the Inventory Service directly."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Inventory Service is healthy', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('UP');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 - Inventory flow",
+      "description": "These requests show a gateway-forwarded read and direct Inventory Service responses. Reservation changes the in-memory stock and is reset when Inventory Service restarts.",
+      "item": [
+        {
+          "name": "2.1 Get stock through Gateway",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{baseUrl}}/api/inventory/{{sku}}",
+            "description": "The request enters the gateway, which forwards it to Inventory Service. The same correlation ID should appear in both service logs."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Stock lookup returns the requested SKU', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.sku).to.eql(pm.environment.get('sku'));",
+                  "  pm.expect(body.available).to.be.a('number');",
+                  "});",
+                  "pm.test('Correlation ID is returned', function () {",
+                  "  pm.expect(pm.response.headers.get('X-Correlation-ID')).to.eql(pm.environment.get('correlationId'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.2 Unknown SKU returns 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{baseUrl}}/api/inventory/{{unknownSku}}",
+            "description": "Demonstrates the service's not-found response for a SKU that is not in the in-memory sample map."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Unknown SKU returns 404', function () {",
+                  "  pm.response.to.have.status(404);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.3 Reserve stock directly",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{inventoryServiceUrl}}/api/inventory/{{sku}}/reserve?quantity={{quantity}}",
+            "description": "Calls Inventory Service directly and decrements available stock by quantity. Every successful run changes the in-memory sample state."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Reservation succeeds', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().available).to.be.a('number');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.4 Invalid reservation quantity returns 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{inventoryServiceUrl}}/api/inventory/{{sku}}/reserve?quantity=0",
+            "description": "Checks that Inventory Service rejects a non-positive reservation quantity."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Invalid reservation returns 400', function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 - Order flow",
+      "description": "Run 3.1 before 3.2. The create request saves its returned ID in the selected Postman environment as orderId.",
+      "item": [
+        {
+          "name": "3.1 Create order through Gateway",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Order is created', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.status).to.eql('PENDING');",
+                  "  pm.environment.set('orderId', body.id);",
+                  "});",
+                  "pm.test('Correlation ID is returned', function () {",
+                  "  pm.expect(pm.response.headers.get('X-Correlation-ID')).to.eql(pm.environment.get('correlationId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"sku\": \"{{sku}}\",\n  \"quantity\": {{quantity}}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/orders",
+            "description": "The gateway forwards this request to Order Service. Order Service writes to PostgreSQL and publishes an OrderCreated event to Kafka. The generated idempotency key is unique for each run."
+          }
+        },
+        {
+          "name": "3.2 Get created order through Gateway",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "url": "{{baseUrl}}/api/orders/{{orderId}}",
+            "description": "Fetches the order created by request 3.1 using the orderId environment variable saved by its test script."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Created order can be fetched', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.environment.get('orderId'));",
+                  "  pm.expect(body.customerId).to.eql(pm.environment.get('customerId'));",
+                  "  pm.expect(body.sku).to.eql(pm.environment.get('sku'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.3 Invalid order quantity returns 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"sku\": \"{{sku}}\",\n  \"quantity\": 0\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/orders",
+            "description": "Confirms request validation rejects a quantity below one before an order is created."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Invalid order returns 400', function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
