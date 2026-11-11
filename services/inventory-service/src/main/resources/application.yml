@@ -3,11 +3,20 @@ server:
 spring:
   application:
     name: inventory-service
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/shopsphere}
+    username: ${DATABASE_USERNAME:shopsphere}
+    password: ${DATABASE_PASSWORD:local_dev_only}
+  sql:
+    init:
+      mode: always
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     consumer:
       group-id: inventory-service
-      auto-offset-reset: earliest
+      auto-offset-reset: ${KAFKA_AUTO_OFFSET_RESET:latest}
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 management:
   endpoints:
     web:

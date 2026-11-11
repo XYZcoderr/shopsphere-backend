@@ -4,6 +4,29 @@ This guide is for someone new to Postman and Spring Boot. It explains how to sta
 
 > **Important:** ShopSphere is a backend learning project. It does not include a web shop or visual user interface. Postman acts as the client: you send an HTTP request and inspect the response. The services and data changes are visible in VS Code terminals, log files, PostgreSQL, and Kafka.
 
+## One picture before you start
+
+The Spring Boot applications are separate processes that you start in separate terminals. Docker Compose starts only PostgreSQL and Kafka. Postman sends the HTTP request to Gateway, and Gateway forwards it to the service that owns the route. Order Service communicates with Inventory Service asynchronously through Kafka.
+
+```mermaid
+flowchart LR
+  Postman[Postman client]
+  Gateway[API Gateway\nlocalhost:8080]
+  Orders[Order Service\nlocalhost:8081]
+  Inventory[Inventory Service\nlocalhost:8082]
+  DB[(PostgreSQL\nlocalhost:5432)]
+  Kafka[(Kafka\nlocalhost:9092)]
+  Postman -->|GET /api/inventory/**\nPOST or GET /api/orders/**| Gateway
+  Gateway -->|order route| Orders
+  Gateway -->|inventory route| Inventory
+  Orders -->|save order| DB
+  Orders -->|OrderCreated| Kafka
+  Kafka -->|consumer group inventory-service| Inventory
+  Inventory -->|read/update stock and reservation| DB
+```
+
+This diagram represents the local setup. Database tables are logically owned by services, but the learning setup uses one PostgreSQL database instance. The post-create response is `PENDING`; wait for Inventory Service to consume Kafka before checking its reservation.
+
 For the complete source tree, configuration, architecture, and extension notes, see [Running and extending ShopSphere](11-running-and-extending.md). For extra Postman response assertions and the presenter script, see [Postman walkthrough and request tracing](12-postman-and-request-tracing.md).
 
 ## 1. Tools you need
@@ -37,7 +60,7 @@ These are the infrastructure dependencies:
 
 | Dependency | Local address | Used for |
 |---|---|---|
-| PostgreSQL | `localhost:5432` | Stores orders created by Order Service. |
+| PostgreSQL | `localhost:5432` | Stores orders, seeded inventory stock, and order reservation results in the local setup. |
 | Kafka | `localhost:9092` | Carries order-created events. |
 
 Compose starts only the database and broker. It does **not** start the three Spring Boot applications.
@@ -78,7 +101,7 @@ Wait until each terminal prints a line containing `Started ...`. The first run c
 |---|---:|---|
 | API Gateway | 8080 | The public entry point. Routes order requests to port 8081 and inventory requests to port 8082. |
 | Order Service | 8081 | Validates order requests, writes orders to PostgreSQL, publishes Kafka events, and reads orders back. |
-| Inventory Service | 8082 | Looks up and reserves sample stock held in memory. |
+| Inventory Service | 8082 | Reads PostgreSQL stock and consumes order-created Kafka events to reserve it. |
 
 The gateway is a separate Spring Boot application using Spring Cloud Gateway. Order and Inventory are also Spring Boot applications. This project uses a **microservice** layout: each service runs as a separate process and owns its own API behavior.
 
@@ -94,13 +117,15 @@ Use Postman Desktop for the simplest connection to services on your computer.
 
 The environment supplies the local URLs and sample values. The collection already includes request methods, headers, example request bodies, correlation IDs, and response checks. For the guided run, you normally do not need to type any data.
 
+**When the collection file changes:** Postman does not automatically refresh workspace collections from disk. Import `postman/shopsphere-local.postman_collection.json` again. If Postman offers to update or replace the existing **ShopSphere Local API**, choose that option. If it creates a second copy, open the newly imported collection and confirm it contains requests **3.3** through **3.7**; use that copy for this walkthrough. The environment file only needs to be imported once unless its values have changed.
+
 The important environment values are:
 
 | Variable | Default value | Purpose |
 |---|---|---|
 | `baseUrl` | `http://localhost:8080` | API Gateway URL. |
 | `orderServiceUrl` | `http://localhost:8081` | Direct Order Service URL for its health check. |
-| `inventoryServiceUrl` | `http://localhost:8082` | Direct Inventory Service URL and direct reservation example. |
+| `inventoryServiceUrl` | `http://localhost:8082` | Direct Inventory Service URL for comparing direct calls with Gateway routing. |
 | `sku` | `BK-001` | Sample inventory item. |
 | `customerId` | `customer-123` | Sample customer on order creation. |
 | `quantity` | `1` | Units to reserve or order. |
@@ -155,12 +180,12 @@ In the response panel, click **Headers** and find `X-Correlation-ID`. The same v
 
 Open **2 - Inventory flow → 2.3 Reserve stock directly** and click **Send**.
 
-- **Method:** `POST` — asks Inventory Service to change its sample state.
+- **Method:** `POST` — asks Inventory Service to reserve persisted stock.
 - **URL:** `http://localhost:8082/api/inventory/BK-001/reserve?quantity=1`.
-- **Expected:** `200 OK`; body contains `sku` and `available` reduced by one (normally 24 after starting at 25).
+- **Expected:** `200 OK`; body contains `sku` and `available` reduced by one (normally 24 if a fresh database was seeded at 25 immediately before this request).
 - This request goes directly to Inventory Service, so there should be an inventory log entry and no gateway log entry for this specific request.
 
-Now send **2.1 Get stock through Gateway** again. The body should show the new, lower stock count. This is the visible “change” in the demo. Inventory is held in memory, so restarting Inventory Service resets the sample stock to 25 for `BK-001` and 10 for `BK-002`.
+Now send **2.1 Get stock through Gateway** again. The body should show the new, lower stock count. This is the visible “change” in the demo. Stock is stored in PostgreSQL, so it survives an Inventory Service restart. The sample values 25 for `BK-001` and 10 for `BK-002` seed a fresh database only.
 
 Two useful error examples:
 
@@ -198,6 +223,8 @@ The imported collection fills these values in using the selected environment. Cl
 - The response's `id` is saved automatically as the Postman environment variable `orderId`.
 - The request goes to Gateway, which routes it to Order Service on port 8081.
 
+Order Service calls Kafka's asynchronous send method but does not wait for a broker acknowledgement. A `201` confirms the order record was created; confirm the event separately in the Kafka viewer and Inventory Service log. The database insert and event send are not one transaction in this teaching baseline.
+
 ### Step 5 — Read the new order back (`GET`)
 
 Open **3 - Order flow → 3.2 Get created order through Gateway**, then click **Send**.
@@ -208,7 +235,13 @@ Open **3 - Order flow → 3.2 Get created order through Gateway**, then click **
 
 Always create the order before running this request. If `orderId` is blank, Postman has no order ID to insert into the URL.
 
-The invalid order example **3.3 Invalid order quantity returns 400** sends a POST with quantity `0`. Expect `400 Bad Request`. Validation should reject it before inserting an order.
+### Step 6 — Check the asynchronous inventory reservation
+
+After the Inventory Service terminal or `logs/inventory-service.log` shows `event=OrderCreated` for this order ID, send **3.3 Check reservation through Gateway**. Expect `200 OK` and `status: RESERVED`. Then send **3.4 Check remaining stock through Gateway**; the available count should be reduced by the order quantity. If you send the reservation lookup before the event is processed, it can return 404; wait for the consumer log and retry.
+
+For a downstream failure demonstration, send **3.6 Create order for unknown SKU**, wait for the Inventory Service `REJECTED` log, then send **3.7 Check rejected reservation through Gateway**. It should show `REJECTED` and `UNKNOWN_SKU`. The order still returns `PENDING`, because this demo does not send a result event back to Order Service.
+
+The invalid order example **3.5 Invalid order quantity returns 400** sends a POST with quantity `0`. Expect `400 Bad Request`. Validation should reject it before inserting an order.
 
 ## 7. Where to see logs live
 
@@ -233,7 +266,7 @@ You can also expand the `logs/` folder in the VS Code Explorer and open the file
 
 For a request sent through the gateway, expect a start and completion line in the gateway file and another pair in the destination service file. Find the Postman response's **Headers → X-Correlation-ID** and search for the same ID in the logs. The log lines show the component, HTTP method, path, status, and duration. They deliberately do not include the request body or credentials.
 
-## 8. Where to see the saved order and Kafka event
+## 8. Where to see the saved order, Kafka event, and reservation
 
 An order response in Postman is not the only evidence that the application did work. After a successful create request, inspect PostgreSQL from a terminal:
 
@@ -243,14 +276,28 @@ docker compose exec postgres psql -U shopsphere -d shopsphere -c "SELECT id, cus
 
 The most recent row should match the create-order response. This shows the order was persisted in the database.
 
-If the Kafka viewer from step 4 is running, a JSON event should appear on topic `orders.created.v1`. Its `orderId` should match the new order's ID. This shows Order Service published an event for downstream consumers.
+In a second terminal, start a Kafka console consumer before creating the next order:
+
+```sh
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:19092 --topic orders.created.v1
+```
+
+Now send **3.1 Create order through Gateway** again. The console should print JSON containing `orderId`, `sku`, and `quantity`. The order response is `PENDING`: the HTTP request has finished, while inventory work happens asynchronously. Inventory Service consumes that event, makes one atomic stock decrement, and writes a reservation row. Find the matching line in `logs/inventory-service.log`, then send **3.3 Check reservation through Gateway** and **3.4 Check remaining stock through Gateway**. A successful reservation response has `status: RESERVED`; the stock count is lower by the requested quantity. If the reservation request returns 404 immediately, the Kafka listener has not finished yet; wait for its log line and retry it.
+
+Inspect inventory persistence with:
+
+```sh
+docker compose exec postgres psql -U shopsphere -d shopsphere -c "SELECT sku, available FROM inventory_stock ORDER BY sku; SELECT order_id, sku, quantity, status, reason FROM inventory_reservations ORDER BY order_id DESC LIMIT 5;"
+```
+
+The message and reservation use the same order ID, which lets you connect Order Service, Kafka, Inventory Service, and PostgreSQL in the demo.
 
 ## 9. What the demo does and does not do
 
 - **Gateway:** routes requests. It does not contain order or inventory business logic.
-- **Inventory Service:** reads and reserves sample stock in a concurrent in-memory map. Inventory is not persisted and resets when the service restarts.
+- **Inventory Service:** reads stock and processes order reservations with atomic PostgreSQL updates. A unique order ID makes repeated Kafka delivery idempotent for the reservation.
 - **Order Service:** validates order input, writes orders to PostgreSQL, publishes an event to Kafka, and retrieves orders from PostgreSQL.
-- **Important:** creating an order does **not** reserve inventory in this starter. The order and inventory demos are separate. An order-to-inventory workflow is a future extension.
+- **Order flow:** creating an order publishes `OrderCreated`; Inventory Service consumes it and reserves stock asynchronously. The order remains `PENDING`; a reservation-result event and status update are a future extension.
 - **Current teaching limitation:** the PostgreSQL insert and Kafka publication happen as separate operations. A transactional outbox is a future improvement described in the curriculum.
 - **Security:** the local default permits requests without a token when `JWT_ISSUER_URI` is empty. Do not expose this development setup publicly.
 
@@ -260,7 +307,9 @@ If the Kafka viewer from step 4 is running, a JSON event should appear on topic 
 |---|---|
 | `gateway/src/main/resources/application.yml` | Routes from Gateway to Order and Inventory. |
 | `gateway/src/main/java/com/shopsphere/gateway/RequestLoggingWebFilter.java` | Adds/forwards a correlation ID and logs gateway requests. |
-| `services/inventory-service/src/main/java/com/shopsphere/inventory/InventoryController.java` | Inventory GET lookup and POST reservation logic. |
+| `services/inventory-service/src/main/java/com/shopsphere/inventory/InventoryController.java` | Stock lookup, atomic direct reservation, and idempotent order reservation logic. |
+| `services/inventory-service/src/main/java/com/shopsphere/inventory/OrderCreatedListener.java` | Kafka listener that consumes order-created events and records the stock reservation. |
+| `services/inventory-service/src/main/resources/schema.sql` | Seeded stock table and durable reservation table. |
 | `services/inventory-service/src/main/java/com/shopsphere/inventory/RequestLoggingFilter.java` | Inventory request log records. |
 | `services/order-service/src/main/java/com/shopsphere/orders/OrderController.java` | Order POST creation, PostgreSQL insert, Kafka publish, and GET retrieval. |
 | `services/order-service/src/main/resources/schema.sql` | PostgreSQL order table and constraints. |
@@ -284,6 +333,7 @@ To start stopped containers later, run `docker compose start`. To remove contain
 | Problem | What to check |
 |---|---|
 | Postman says it cannot connect | Confirm all three Spring Boot terminals are still running and that Docker is running. Run the health checks. |
+| Postman says import completed, but Collections is still empty or the tab says `Collection not found` | Quit and reopen Postman to refresh its workspace list, confirm you are in **My Workspace → Items in Cloud**, and expand **ShopSphere Local API**. If an old same-named empty entry still blocks import, import `shopsphere-local.postman_collection.json` again and choose **Import as Copy**. The imported copy should contain the three numbered folders. |
 | Postman shows `{{baseUrl}}` or unresolved variables | Select the **ShopSphere Local** environment in the top-right environment menu. |
 | `mvn` command is not found | Install Maven and open a new terminal; follow the prerequisite instructions in the [running guide](11-running-and-extending.md#1-what-you-need). |
 | PostgreSQL connection error | Check `docker compose ps`; wait for `postgres` to show `healthy`. |

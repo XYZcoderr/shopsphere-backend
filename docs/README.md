@@ -6,7 +6,10 @@ This page is the map to the ShopSphere backend docs. Choose the path that matche
 
 1. Start with [Beginner run and Postman guide](13-beginner-run-and-postman-guide.md). It covers prerequisites, starting Docker dependencies and Spring Boot apps, importing Postman files, sending GET/POST requests, viewing logs, and seeing PostgreSQL/Kafka output.
 2. Use [Postman walkthrough and request tracing](12-postman-and-request-tracing.md) for a longer presenter script, assertions, correlation IDs, and a code tour.
-3. Use [Running and extending ShopSphere](11-running-and-extending.md) for the complete setup details, project tree, configuration, troubleshooting, and extension process.
+3. Use [Classroom demo script](15-student-demo-script.md) as the detailed presenter runbook: exact startup commands and Postman clicks, expected response bodies, where to find every log/event/database change, failure examples, troubleshooting, and what each screen proves.
+4. Use the [three-day teaching plan](16-three-day-teaching-plan.md) to present the topics in date-wise sessions on October 21, 28, and 29, with seven topics, matching demonstrations, and learner outcomes for each date.
+5. Use [Running and extending ShopSphere](11-running-and-extending.md) for the complete setup details, project tree, configuration, troubleshooting, and extension process.
+6. Use [`postman/README.md`](../postman/README.md) when you need a compact map of every imported Postman request, environment variable, expected result, and how to rerun the collection.
 
 ## I want to understand what this project is and why it is structured this way
 
@@ -33,11 +36,11 @@ Read [Project purpose, concepts, and production roadmap](14-project-purpose-conc
 The runnable baseline currently contains:
 
 - API Gateway, Order Service, and Inventory Service as Spring Boot applications.
-- Local PostgreSQL for order records and Kafka for the `OrderCreated` event.
-- Inventory sample stock stored in process memory.
+- Local PostgreSQL for order records, stock, and reservation results; Kafka for the `OrderCreated` event.
+- Inventory Service consumes order events and makes idempotent stock reservations.
 - Local Postman collection/environment and correlation-ID request logs.
 
-Architecture plans and learning exercises also discuss identity providers, persistent inventory, Kafka consumers, payments, notifications, realtime, webhooks, transactional outbox, and saga orchestration. A topic in a curriculum document does not mean that a corresponding service or production capability is already implemented. See the [project guide](14-project-purpose-concepts-and-production-roadmap.md) for the current/future boundary and the production gap list.
+Architecture plans and learning exercises also discuss identity providers, reservation-result events, payments, notifications, realtime, webhooks, transactional outbox, and saga orchestration. A topic in a curriculum document does not mean that a corresponding service or production capability is already implemented. See the [project guide](14-project-purpose-concepts-and-production-roadmap.md) for the current/future boundary and the production gap list.
 
 ## A safe way to add a feature
 

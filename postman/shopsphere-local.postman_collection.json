@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "7db8902c-5510-46e6-8cef-1c2e37d6de7f",
     "name": "ShopSphere Local API",
-    "description": "Step-by-step local checks for ShopSphere. Run requests in order: health checks, inventory examples, then create an order before fetching it. Each request gets an X-Correlation-ID that is forwarded by the gateway and printed in the gateway and service logs.",
+    "description": "Student demo for ShopSphere. Run health checks, compare Gateway and direct service routes, then create an order and observe its Kafka event, asynchronous inventory reservation, PostgreSQL row, and service logs.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "event": [
@@ -26,7 +26,10 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{baseUrl}}/actuator/health",
             "description": "Checks that the gateway process is accepting requests."
@@ -51,7 +54,10 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{orderServiceUrl}}/actuator/health",
             "description": "Checks the Order Service directly."
@@ -76,7 +82,10 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{inventoryServiceUrl}}/actuator/health",
             "description": "Checks the Inventory Service directly."
@@ -100,14 +109,17 @@
     },
     {
       "name": "2 - Inventory flow",
-      "description": "These requests show a gateway-forwarded read and direct Inventory Service responses. Reservation changes the in-memory stock and is reset when Inventory Service restarts.",
+      "description": "Read stock through Gateway, demonstrate direct reservation, then observe order-driven reservations. Stock is stored in PostgreSQL and survives service restarts.",
       "item": [
         {
           "name": "2.1 Get stock through Gateway",
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{baseUrl}}/api/inventory/{{sku}}",
             "description": "The request enters the gateway, which forwards it to Inventory Service. The same correlation ID should appear in both service logs."
@@ -137,10 +149,13 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{baseUrl}}/api/inventory/{{unknownSku}}",
-            "description": "Demonstrates the service's not-found response for a SKU that is not in the in-memory sample map."
+            "description": "Demonstrates Inventory Service returning not found for a SKU absent from the PostgreSQL stock table."
           },
           "event": [
             {
@@ -161,10 +176,13 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{inventoryServiceUrl}}/api/inventory/{{sku}}/reserve?quantity={{quantity}}",
-            "description": "Calls Inventory Service directly and decrements available stock by quantity. Every successful run changes the in-memory sample state."
+            "description": "Calls Inventory Service directly and atomically decrements available stock in PostgreSQL. Each successful run changes the durable count."
           },
           "event": [
             {
@@ -186,7 +204,10 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{inventoryServiceUrl}}/api/inventory/{{sku}}/reserve?quantity=0",
             "description": "Checks that Inventory Service rejects a non-positive reservation quantity."
@@ -209,7 +230,7 @@
     },
     {
       "name": "3 - Order flow",
-      "description": "Run 3.1 before 3.2. The create request saves its returned ID in the selected Postman environment as orderId.",
+      "description": "Run 3.1 first. It saves orderId and the ordered SKU. The order response is PENDING because reservation is asynchronous. Wait for the Inventory Service consumer log, then check reservation and remaining stock through Gateway.",
       "item": [
         {
           "name": "3.1 Create order through Gateway",
@@ -245,14 +266,27 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}" },
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"sku\": \"{{sku}}\",\n  \"quantity\": {{quantity}}\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": "{{baseUrl}}/api/orders",
             "description": "The gateway forwards this request to Order Service. Order Service writes to PostgreSQL and publishes an OrderCreated event to Kafka. The generated idempotency key is unique for each run."
@@ -263,7 +297,10 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "url": "{{baseUrl}}/api/orders/{{orderId}}",
             "description": "Fetches the order created by request 3.1 using the orderId environment variable saved by its test script."
@@ -287,17 +324,87 @@
           ]
         },
         {
-          "name": "3.3 Invalid order quantity returns 400",
+          "name": "3.3 Check reservation through Gateway",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/inventory/reservations/{{orderId}}",
+            "description": "Inventory Service creates this record after consuming OrderCreated from Kafka. If called too quickly, wait for the consumer log and send again."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Order reservation is visible', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.orderId).to.eql(pm.environment.get('orderId'));",
+                  "  pm.expect(body.sku).to.eql(pm.environment.get('sku'));",
+                  "  pm.expect(body.quantity).to.eql(Number(pm.environment.get('quantity')));",
+                  "  pm.expect(body.status).to.eql('RESERVED');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.4 Check remaining stock through Gateway",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/inventory/{{sku}}",
+            "description": "After a successful reservation, available stock should be lower by the order quantity."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Stock lookup succeeds after the order', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().available).to.be.a('number');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.5 Invalid order quantity returns 400",
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"sku\": \"{{sku}}\",\n  \"quantity\": 0\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": "{{baseUrl}}/api/orders",
             "description": "Confirms request validation rejects a quantity below one before an order is created."
@@ -310,6 +417,79 @@
                 "exec": [
                   "pm.test('Invalid order returns 400', function () {",
                   "  pm.response.to.have.status(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.6 Create order for unknown SKU (reservation rejection demo)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"sku\": \"{{unknownSku}}\",\n  \"quantity\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{baseUrl}}/api/orders",
+            "description": "Valid order input for a SKU that Inventory Service does not know. Order Service still accepts and publishes it; Inventory Service asynchronously records a REJECTED reservation with reason UNKNOWN_SKU."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Order accepted for asynchronous processing', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('PENDING');",
+                  "  pm.environment.set('rejectedOrderId', body.id);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.7 Check rejected reservation through Gateway",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{correlationId}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/inventory/reservations/{{rejectedOrderId}}",
+            "description": "Wait until Inventory Service logs the event, then send this request. It demonstrates a downstream business rejection without rejecting the original HTTP request."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Unknown SKU reservation is rejected', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('REJECTED');",
+                  "  pm.expect(body.reason).to.eql('UNKNOWN_SKU');",
                   "});"
                 ]
               }

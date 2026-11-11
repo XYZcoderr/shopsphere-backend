@@ -1,16 +1,73 @@
-### Inventory lookup
-GET http://localhost:8080/api/inventory/BK-001
+### Local values
+@baseUrl = http://localhost:8080
+@orderServiceUrl = http://localhost:8081
+@inventoryServiceUrl = http://localhost:8082
+@sku = BK-001
+@unknownSku = NO-SUCH-SKU
+@customerId = customer-123
+@quantity = 1
+@orderId = PASTE_ORDER_ID_FROM_CREATE_RESPONSE
+@rejectedOrderId = PASTE_REJECTED_ORDER_ID_FROM_CREATE_RESPONSE
 
-### Reserve one unit (direct inventory service)
-POST http://localhost:8082/api/inventory/BK-001/reserve?quantity=1
+### Gateway health
+GET {{baseUrl}}/actuator/health
 
-### Create order
-POST http://localhost:8080/api/orders
+### Order Service direct health
+GET {{orderServiceUrl}}/actuator/health
+
+### Inventory Service direct health
+GET {{inventoryServiceUrl}}/actuator/health
+
+### Read stock through Gateway
+GET {{baseUrl}}/api/inventory/{{sku}}
+
+### Unknown stock item through Gateway (expect 404)
+GET {{baseUrl}}/api/inventory/{{unknownSku}}
+
+### Reserve one unit directly through Inventory Service
+POST {{inventoryServiceUrl}}/api/inventory/{{sku}}/reserve?quantity={{quantity}}
+
+### Invalid inventory quantity (expect 400)
+POST {{inventoryServiceUrl}}/api/inventory/{{sku}}/reserve?quantity=0
+
+### Create an order through Gateway
+POST {{baseUrl}}/api/orders
 Content-Type: application/json
-Idempotency-Key: demo-order-001
 
 {
-  "customerId": "customer-123",
-  "sku": "BK-001",
+  "customerId": "{{customerId}}",
+  "sku": "{{sku}}",
+  "quantity": {{quantity}}
+}
+
+### Retrieve the created order (replace @orderId above first)
+GET {{baseUrl}}/api/orders/{{orderId}}
+
+### Check the order's inventory reservation (wait for consumer log first)
+GET {{baseUrl}}/api/inventory/reservations/{{orderId}}
+
+### Check remaining stock through Gateway
+GET {{baseUrl}}/api/inventory/{{sku}}
+
+### Invalid order quantity (expect 400)
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+
+{
+  "customerId": "{{customerId}}",
+  "sku": "{{sku}}",
+  "quantity": 0
+}
+
+### Create a valid order for an unknown SKU (expect 201, then async rejection)
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+
+{
+  "customerId": "{{customerId}}",
+  "sku": "{{unknownSku}}",
   "quantity": 1
 }
+
+### Check the unknown-SKU reservation (replace @rejectedOrderId and wait for consumer log)
+GET {{baseUrl}}/api/inventory/reservations/{{rejectedOrderId}}

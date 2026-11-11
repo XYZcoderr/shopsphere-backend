@@ -1,12 +1,50 @@
 # Postman walkthrough and request tracing
 
-Use this guide to send real requests to ShopSphere, check the expected responses, and follow each request through the API Gateway and its downstream service. The collection includes automated status and response checks and uses a shared correlation ID to make the log lines easy to find.
+Use this guide to send real requests to ShopSphere, check the expected responses, and follow each request through the API Gateway and its downstream service. The collection gives each HTTP request a correlation ID; Gateway forwards that same ID to the service handling that request. IDs change from one Postman send to the next.
 
 ## Before you start
 
 Start PostgreSQL and Kafka, then start all three Spring Boot services. Follow the [running guide](11-running-and-extending.md#4-run-the-three-applications). Confirm the infrastructure is healthy with `docker compose ps`; both `postgres` and `kafka` should show `healthy`.
 
 The Postman collection expects the local API Gateway to run at `http://localhost:8080`, the Order Service at `http://localhost:8081`, and the Inventory Service at `http://localhost:8082`. It assumes `JWT_ISSUER_URI` is unset for local development, which permits requests without a bearer token.
+
+## Request map: which application handles each path
+
+```mermaid
+flowchart LR
+  Postman[Postman]
+  GW[API Gateway :8080]
+  OS[Order Service :8081]
+  IS[Inventory Service :8082]
+  PG[(PostgreSQL)]
+  K[(Kafka orders.created.v1)]
+  Postman -->|/api/orders/**| GW
+  Postman -->|/api/inventory/**| GW
+  GW -->|order route| OS
+  GW -->|inventory route| IS
+  OS -->|order rows| PG
+  OS -->|OrderCreated keyed by orderId| K
+  K -->|async consumer| IS
+  IS -->|stock and reservation rows| PG
+```
+
+Compose runs PostgreSQL and Kafka; Maven terminals run the three Spring Boot applications. The Gateway performs HTTP routing. Kafka is not the Gateway: it carries the event after Order Service accepts an order. The [Postman folder README](../postman/README.md) lists every request, variable, and expected status. This guide focuses on what each visible result means and how to trace it.
+
+| Postman folder/request | Target | Expected result / evidence |
+|---|---|---|
+| `1.1` Gateway health | Gateway directly | `200`, `UP`. |
+| `1.2` / `1.3` service health | Order / Inventory directly | `200`, `UP`; shows each is a separate process. |
+| `2.1` stock through Gateway | Gateway → Inventory | `200`; matching per-request correlation ID in both HTTP logs. |
+| `2.2` unknown SKU | Gateway → Inventory | Expected `404`. |
+| `2.3` direct reservation | Inventory directly | `200`; durable stock count decreases; no Gateway business-request log. |
+| `2.4` invalid reservation | Inventory directly | Expected `400`. |
+| `3.1` create order | Gateway → Order | `201`, order `PENDING`; saves `orderId`. Kafka event appears. |
+| `3.2` read order | Gateway → Order | `200`; persisted order row. |
+| `3.3` reservation | Gateway → Inventory | `200`, `RESERVED` after consumer finishes. |
+| `3.4` remaining stock | Gateway → Inventory | `200`; lower stock after successful reservation. |
+| `3.5` invalid order | Gateway → Order | Expected `400`; no created order/event. |
+| `3.6` unknown-SKU order | Gateway → Order | `201`, `PENDING`; downstream event is then rejected. |
+| `3.7` rejection lookup | Gateway → Inventory | `200`, `REJECTED / UNKNOWN_SKU` after consumer finishes. |
 
 ## First time using Postman: where to click and what you will see
 
@@ -88,8 +126,8 @@ If you make a request manually instead of using the collection, replace those ex
 | What you do | What changes or appears | Where to see it |
 |---|---|---|
 | Send a request | Status and JSON response | Postman's response panel under **Body**; status is above the response tabs. |
-| Look up `BK-001` | Stock response, initially 25 after Inventory Service starts | Postman response **Body**. |
-| Reserve one unit | In-memory available stock drops by one | Reservation response, then a second stock lookup. It resets to 25 when Inventory Service restarts. |
+| Look up `BK-001` | Current stored count; 25 only when the SKU is seeded in a fresh database | Postman response **Body**. |
+| Reserve one unit | PostgreSQL available stock drops by one | Reservation response, then a second stock lookup. The change survives service restarts. |
 | Create an order | A new order ID and `PENDING` response | Postman's response **Body**; the collection saves the ID as the environment variable `orderId`. |
 | Retrieve that order | The saved order fields read back | Send **3.2 Get created order through Gateway**; inspect response **Body**. |
 | Save an order | A durable row in PostgreSQL | Run the read-only SQL query in the presenter walkthrough; this is not a graphical database screen. |
@@ -132,7 +170,7 @@ The environment contains the sample SKU (`BK-001`), customer ID, quantity, URLs,
 2. Show the response: HTTP 200, `sku` equal to `BK-001`, and `available` equal to the current count (25 after a fresh Inventory Service start).
 3. Open response **Headers** and point to `X-Correlation-ID`. Find that exact value in the live logs: the gateway logs the request, forwards it, and Inventory Service logs its own handling of it.
 
-**Explain:** Postman is the client. The gateway is the public entry point and routes `/api/inventory/**` to Inventory Service on port 8082. The service reads its in-memory stock map and returns JSON. The correlation ID is a request-tracing value that ties the separate log records together; it is not an order ID or a security token.
+**Explain:** Postman is the client. The gateway is the public entry point and routes `/api/inventory/**` to Inventory Service on port 8082. The service reads its stock from PostgreSQL and returns JSON. The correlation ID is a request-tracing value that ties the separate log records together; it is not an order ID or a security token.
 
 ### Demo B: change inventory and see the result
 
@@ -140,7 +178,7 @@ The environment contains the sample SKU (`BK-001`), customer ID, quantity, URLs,
 2. Send **2.1 Get stock through Gateway** again. It should now report that lower value, while its logs again appear in both Gateway and Inventory Service.
 3. Optionally send **2.4 Invalid reservation quantity returns 400** to show input validation, then **2.2 Unknown SKU returns 404** to show missing-resource handling. The collection's tests count these expected error statuses as successful checks.
 
-**Explain:** this endpoint mutates the sample stock in memory. Inventory starts with `BK-001` at 25 and `BK-002` at 10. A successful reservation subtracts stock; restarting Inventory Service resets the sample values. A zero or negative quantity is rejected with 400, and an unknown SKU returns 404. Inventory data is not persisted in PostgreSQL in this starter.
+**Explain:** this endpoint performs an atomic conditional update in PostgreSQL. On a fresh database, BK-001 starts at 25 and BK-002 at 10. A successful reservation subtracts stock and survives service restarts. A zero or negative quantity is rejected with 400, and an unknown SKU returns 404.
 
 ### Demo C: create an order and inspect PostgreSQL and Kafka
 
@@ -161,11 +199,11 @@ The environment contains the sample SKU (`BK-001`), customer ID, quantity, URLs,
    ```
 
    The row for the latest order should match the `id` and fields returned by Postman. The Kafka consumer should show a JSON event with the same order ID and customer/SKU/quantity fields.
-6. Optionally send **3.3 Invalid order quantity returns 400**. Explain that validation rejects it before an order is inserted or an event is published.
+6. Wait for the Inventory Service consumer log, then send **3.3 Check reservation through Gateway** and **3.4 Check remaining stock through Gateway**. For downstream rejection, use **3.6** and **3.7**. **3.5 Invalid order quantity returns 400** shows validation before persistence.
 
-**Explain:** Order Service validates the JSON, writes the order row to PostgreSQL, and publishes an `OrderCreated` event to Kafka topic `orders.created.v1`. PostgreSQL is used for querying the order later; Kafka communicates that an order was created to other services. The gateway routes `/api/orders/**` to Order Service on port 8081. In this learning baseline, database insert and Kafka publication are separate operations (a dual-write flaw); the transactional outbox is a later extension topic.
+**Explain:** Order Service validates the JSON, writes the order row to PostgreSQL, and publishes `OrderCreated` to `orders.created.v1`. Inventory Service consumes it, atomically reserves stock, and stores an idempotent reservation. The gateway routes order and inventory paths to their owning services. Database insert and Kafka publication remain separate operations (a dual-write flaw); the transactional outbox is a later extension topic.
 
-**Important scope detail:** creating an order currently does **not** reserve or reduce inventory. The order and inventory endpoints are separate demonstrations, and there is no implemented orchestration connecting them. Do not claim the order flow checks stock. A saga or order-to-inventory workflow can be added as an extension.
+**Next:** send **3.3 Check reservation through Gateway** and **3.4 Check remaining stock through Gateway** after the Inventory Service consumer log appears. The order endpoint returns before this asynchronous work completes, so an immediate reservation lookup can return 404; wait for the log and retry.
 
 ### Quick explanation of the concepts shown
 
@@ -178,7 +216,7 @@ The environment contains the sample SKU (`BK-001`), customer ID, quantity, URLs,
 | Persistence | Postman order ID and the PostgreSQL query result | An order row survives an Order Service restart because it is stored in PostgreSQL. |
 | Event messaging | Kafka consumer output on `orders.created.v1` | A service can publish a fact so other consumers can react without being called in the same HTTP request. |
 | Correlation ID | Same `X-Correlation-ID` in response and service logs | A label connects log records from the separate components that handled one request. |
-| In-memory state | Stock count changes and resets when Inventory Service restarts | This sample state belongs to the running process; it is not durable storage. |
+| Asynchronous event handling | Inventory log shows a reservation after order creation | Kafka decouples order acceptance from inventory processing; inspect the reservation endpoint and PostgreSQL. |
 
 ### Where to open the code while presenting
 
@@ -188,7 +226,8 @@ Open these files in your IDE before the demo so you can move from a request to t
 |---|---|---|
 | Gateway receives and routes | [`gateway/src/main/resources/application.yml`](../gateway/src/main/resources/application.yml) | Route predicates and the Order/Inventory destination URLs. |
 | Correlation ID and gateway logs | [`RequestLoggingWebFilter.java`](../gateway/src/main/java/com/shopsphere/gateway/RequestLoggingWebFilter.java) | Reads or creates the ID, forwards it, returns it, and logs request timing. |
-| Stock lookup and reservation | [`InventoryController.java`](../services/inventory-service/src/main/java/com/shopsphere/inventory/InventoryController.java) | `getStock` reads the map; `reserve` validates and updates the in-memory count. |
+| Stock lookup and reservation | [`InventoryController.java`](../services/inventory-service/src/main/java/com/shopsphere/inventory/InventoryController.java) | `getStock` reads PostgreSQL; `reserve` atomically updates stock and `reserveForOrder` deduplicates by order ID. |
+| Order event consumer | [`OrderCreatedListener.java`](../services/inventory-service/src/main/java/com/shopsphere/inventory/OrderCreatedListener.java) | Reads the Kafka JSON, asks inventory to reserve, and logs the outcome. |
 | Order creation and retrieval | [`OrderController.java`](../services/order-service/src/main/java/com/shopsphere/orders/OrderController.java) | `create` validates, inserts with JDBC, and sends a Kafka event; `get` reads the row back. |
 | Order table | [`schema.sql`](../services/order-service/src/main/resources/schema.sql) | PostgreSQL columns, quantity constraint, and idempotency-key index. |
 | Local database and broker | [`compose.yaml`](../compose.yaml) | PostgreSQL and Kafka containers, ports, health checks, and local broker listeners. |
@@ -197,7 +236,7 @@ The response/logging sequence is easier to follow when you keep Postman, the log
 
 ### Presenter closing checkpoint
 
-Finish by showing the created order in Postman, its PostgreSQL row, the Kafka event, and the matching gateway/order logs. Then state the current boundary clearly: inventory reservation is independent, stock resets on restart, and the order write plus event publish are not yet atomic. These are concrete extension exercises rather than hidden features.
+Finish by showing the order row, Kafka event, reservation row, reduced stock, and logs from all services. Reservation is asynchronous; the order remains PENDING because no result event updates its status. The order insert and event publish remain a non-atomic dual write.
 
 ## Run the walkthrough one request at a time
 
@@ -221,7 +260,7 @@ Open **2 - Inventory flow** and run the requests in order:
 
 1. **`2.1 Get stock through Gateway`** sends `GET /api/inventory/BK-001` to port 8080. Expect HTTP 200 with a body like `{"sku":"BK-001","available":25}`. The test checks the SKU, numeric stock count, and returned correlation ID. This request should appear in both Gateway and Inventory Service logs.
 2. **`2.2 Unknown SKU returns 404`** sends a lookup for `NO-SUCH-SKU`. Expect HTTP 404. This is a deliberate error-path check; Postman marks the test as passed when the service returns the expected 404.
-3. **`2.3 Reserve stock directly`** sends `POST /api/inventory/BK-001/reserve?quantity=1` directly to port 8082. Expect HTTP 200 and a numeric `available` value. This changes in-memory stock, so each successful run lowers the count. Restarting Inventory Service restores its sample stock.
+3. **`2.3 Reserve stock directly`** sends `POST /api/inventory/BK-001/reserve?quantity=1` directly to port 8082. Expect HTTP 200 and a numeric `available` value. This changes stock in PostgreSQL, so each successful run lowers the count. Restarting Inventory Service does not restore stock.
 4. **`2.4 Invalid reservation quantity returns 400`** sends a reservation with quantity zero. Expect HTTP 400 because quantities must be positive.
 
 ### 3. Create, then retrieve an order
@@ -230,15 +269,17 @@ Run the requests in **3 - Order flow** in order:
 
 1. **`3.1 Create order through Gateway`** sends a JSON request to `POST /api/orders` through port 8080. Expect HTTP 201 and a JSON response with an order ID and status `PENDING`. A Postman test saves the response ID into the selected environment's `orderId` variable. The request uses a new idempotency key every time it runs.
 2. **`3.2 Get created order through Gateway`** sends `GET /api/orders/{{orderId}}`. Expect HTTP 200 and the order details. It checks that the ID, customer ID, and SKU match the order you created.
-3. **`3.3 Invalid order quantity returns 400`** sends an order with quantity zero. Expect HTTP 400. Validation should reject it before creating an order.
+3. **`3.3 Check reservation through Gateway`** reads the result after Kafka consumption; wait for the listener log if necessary. **`3.4 Check remaining stock through Gateway`** shows the updated count.
+4. **`3.5 Invalid order quantity returns 400`** sends quantity zero and expects HTTP 400.
+5. **`3.6` and `3.7`** demonstrate that an accepted order can lead to a rejected inventory reservation for an unknown SKU.
 
 If you run `3.2` before `3.1`, `orderId` is empty and the lookup will fail. Create a fresh order first, then run the lookup again.
 
 ## Run the whole collection
 
-After confirming the environment is selected, select the collection's **Run** option to open Collection Runner. Run folders in numerical order. The health checks run first; the order folder creates and stores an order ID before fetching it. Review the final test summary for any failed assertions.
+After confirming the environment is selected, select the collection's **Run** option to open Collection Runner. Run folders in numerical order. Set a **1,000 ms delay** between requests so the asynchronous Inventory Service consumer can process an order before the reservation lookup. The health checks run first; the order folder creates and stores an order ID before fetching and checking its reservation. Review the final test summary for any failed assertions.
 
-The reservation request changes sample state each time. If you run the collection repeatedly, inventory availability continues to decrease until the Inventory Service restarts. The invalid requests are expected to return 404 or 400; those status codes count as passing checks because the tests assert the expected behavior.
+Direct and order-driven reservations change durable stock each time. Repeated collection runs will continue to reduce availability. The invalid requests are expected to return 404 or 400; those status codes count as passing checks because the tests assert the expected behavior. The unknown-SKU order is accepted first, then its reservation is recorded as rejected.
 
 ## Follow a request through the logs
 
@@ -257,7 +298,9 @@ For an order request, look for `component=gateway` and `component=orders`. The s
 
 The logs include the component name, correlation ID, HTTP method, URL path, status, and duration. They intentionally omit request bodies, query values, authorization headers, and other credentials. The raw ID is limited to a safe 64-character set before it is logged.
 
-Each service also writes a rolling log file in the repository's `logs/` directory:
+The HTTP correlation ID applies to one HTTP request through Gateway and its destination service. The current `OrderCreated` Kafka payload does not contain that header. When you follow asynchronous work, use the `orderId` across the create response, Kafka message, Inventory Service consumer log, and reservation lookup. This distinction prevents expecting the HTTP correlation ID in the event consumer log.
+
+Each service also writes a log file in the repository's `logs/` directory:
 
 | Log file | Contains |
 |---|---|
@@ -310,10 +353,11 @@ Keep those terminals open while sending Postman requests. The same log entries a
 | Component | Example | Behavior |
 |---|---|---|
 | API Gateway | `GET /api/inventory/BK-001` | Receives the public request and routes it to Inventory Service. |
-| Inventory Service | `GET /api/inventory/BK-001` | Reads the sample in-memory stock map. |
-| Inventory Service | `POST /api/inventory/BK-001/reserve?quantity=1` | Decrements sample stock in memory. |
+| Inventory Service | `GET /api/inventory/BK-001` | Reads stock from PostgreSQL. |
+| Inventory Service | `POST /api/inventory/BK-001/reserve?quantity=1` | Atomically decrements stock in PostgreSQL. |
 | Order Service | `POST /api/orders` | Validates input, inserts an order in PostgreSQL, then publishes `OrderCreated` to Kafka. |
 | Order Service | `GET /api/orders/{id}` | Reads an order from PostgreSQL. |
+| Inventory Service | `GET /api/inventory/reservations/{orderId}` | Reads the asynchronous reservation result by order ID. |
 
 The current Order Service performs its PostgreSQL write and Kafka send as separate operations. The outbox pattern is a learning task, not yet implemented. The idempotency-key database column is present, but response replay is not implemented; Postman creates unique keys so the normal order walkthrough succeeds on repeated runs.
 
@@ -334,6 +378,14 @@ For local mode, start the Gateway with `JWT_ISSUER_URI` unset or empty. If a tru
 ### Order creation returns 500
 
 Check PostgreSQL and Kafka health and review the Order Service log. If you manually reused an idempotency key, choose a new key: the unique database index exists, but the starter does not replay the earlier response for repeated keys.
+
+### Order creation returns 201 but the Kafka event or reservation is missing
+
+The create endpoint sends the event asynchronously and does not wait for Kafka acknowledgement. Check the Order Service log and Kafka health, confirm the console consumer is reading `orders.created.v1`, and check Inventory Service logs. This is the current database/Kafka dual-write limitation; the transactional outbox is a future exercise.
+
+### Reservation lookup returns 404 immediately after order creation
+
+The HTTP request can finish before the Inventory Service listener processes the Kafka message. Search `logs/inventory-service.log` for `event=OrderCreated` and the matching `orderId`; send **3.3** again after that line appears.
 
 ### The order request returns 201 but fetching it returns 404
 

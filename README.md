@@ -10,6 +10,7 @@ ShopSphere Backend is a hands-on Java and Spring Boot learning project for under
 
 - **New to the project or Postman?** Follow the [Beginner Run and Postman Guide](docs/13-beginner-run-and-postman-guide.md). It shows setup, exact requests, expected responses, and where to see logs, database rows, and Kafka events.
 - **Want the big picture?** Read the [Project Purpose, Concepts, and Production Roadmap](docs/14-project-purpose-concepts-and-production-roadmap.md).
+- **Teaching this over three sessions?** Use the [date-wise teaching plan](docs/16-three-day-teaching-plan.md) for October 21, 28, and 29, including the Postman, terminal, Kafka, and database demonstrations.
 - **Looking for a map of all docs?** Open the [Documentation Index](docs/README.md).
 - **Want to contribute?** Read [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -32,9 +33,10 @@ flowchart LR
   Client[Postman or HTTP client] --> Gateway[API Gateway :8080]
   Gateway -->|/api/orders/**| Orders[Order Service :8081]
   Gateway -->|/api/inventory/**| Inventory[Inventory Service :8082]
-  Orders -->|JDBC| PostgreSQL[(PostgreSQL)]
   Orders -->|OrderCreated| Kafka[(Kafka topic orders.created.v1)]
-  Inventory --> Stock[In-memory sample stock]
+  Kafka -->|consume and reserve| Inventory
+  Orders -->|JDBC| PostgreSQL
+  Inventory -->|stock and reservations| PostgreSQL
 ```
 
 | Component | Purpose | Local address |
@@ -42,8 +44,8 @@ flowchart LR
 | API Gateway | Public entry point; routes API requests to the owning service. | `http://localhost:8080` |
 | Order Service | Creates and reads orders; stores them in PostgreSQL and publishes an event to Kafka. | `http://localhost:8081` |
 | Inventory Service | Looks up and reserves sample product stock. | `http://localhost:8082` |
-| PostgreSQL | Stores order records. | `localhost:5432` |
-| Kafka | Carries order-created events. | `localhost:9092` |
+| PostgreSQL | Stores orders, stock, and reservation records in the local learning setup. | `localhost:5432` |
+| Kafka | Carries order-created events from Order Service to Inventory Service. | `localhost:9092` |
 
 This is the **implemented local flow**. The curriculum also describes future services and patterns that are not yet present in the runnable code. See [Current scope and production roadmap](docs/14-project-purpose-concepts-and-production-roadmap.md#current-implementation-and-future-architecture).
 
@@ -135,10 +137,11 @@ All routes below are available through the gateway on port 8080 unless marked **
 
 | Method | Request | Expected result | Behavior |
 |---|---|---:|---|
-| `GET` | `/api/inventory/BK-001` | `200 OK` | Reads sample stock through Gateway. |
-| `POST` | `/api/inventory/BK-001/reserve?quantity=1` (direct to port 8082) | `200 OK` | Reserves one unit in Inventory Service's in-memory map. |
-| `POST` | `/api/orders` | `201 Created` | Creates an order, stores it in PostgreSQL, and publishes `OrderCreated` to Kafka. |
+| `GET` | `/api/inventory/BK-001` | `200 OK` | Reads stock through Gateway. |
+| `POST` | `/api/inventory/BK-001/reserve?quantity=1` | `200 OK` | Direct inventory demonstration; decrements stock atomically. |
+| `POST` | `/api/orders` | `201 Created` | Stores a `PENDING` order and publishes `OrderCreated`; Inventory Service reserves asynchronously. |
 | `GET` | `/api/orders/{id}` | `200 OK` | Retrieves an order from PostgreSQL by ID. |
+| `GET` | `/api/inventory/reservations/{orderId}` | `200 OK` | Shows the asynchronous reservation result (`RESERVED` or `REJECTED`). |
 
 Create-order JSON body:
 
@@ -178,11 +181,10 @@ Get-Content logs/inventory-service.log -Wait
 
 ## Current scope and limitations
 
-- Inventory stock is held in memory. It resets when Inventory Service restarts and is not shared between service instances.
-- Creating an order does **not** reserve inventory. The order and inventory APIs are currently separate flows.
+- Inventory stock and reservation records are stored in PostgreSQL. Local Compose uses one database instance; production should isolate credentials and ownership.
+- Creating an order publishes `OrderCreated`; Inventory Service consumes it and reserves stock asynchronously. The order remains `PENDING` because no reservation-result event updates the order status yet.
 - Order Service writes to PostgreSQL and publishes to Kafka as separate operations. The transactional outbox pattern is a learning task.
 - An idempotency-key column and unique index exist, but the API does not replay the original response for a repeated key.
-- Kafka receives order-created events, but Inventory Service does not consume them yet.
 - There is no running Payment, Notification, Realtime, or Webhook service and no bundled identity provider.
 - Local Gateway mode permits requests without a token when `JWT_ISSUER_URI` is empty. The project does not provide complete production authorization.
 - The local Compose setup is for learning. It is a single PostgreSQL database and single-node Kafka broker, not a high-availability production deployment.
@@ -197,6 +199,8 @@ These boundaries are intentional topics for extension. The [production roadmap](
 | [Beginner run and Postman guide](docs/13-beginner-run-and-postman-guide.md) | Setup, Postman steps, expected results, and where to see logs/data. |
 | [Project purpose and production roadmap](docs/14-project-purpose-concepts-and-production-roadmap.md) | Why the services exist, concepts taught, current/future scope, and production gaps. |
 | [Postman tracing walkthrough](docs/12-postman-and-request-tracing.md) | Presenter script, response checks, correlation IDs, and code tour. |
+| [Postman folder guide](postman/README.md) | Every collection request, environment value, expected result, and repeat-run note. |
+| [Classroom demo script](docs/15-student-demo-script.md) | Step-by-step Gateway, order, Kafka, inventory reservation, and failure demonstration. |
 | [Running and extending](docs/11-running-and-extending.md) | Prerequisites, configuration, project structure, troubleshooting, and extension steps. |
 | [Architecture and domain boundaries](docs/01-architecture.md) | Service ownership and communication choices. |
 | [Implementation specification](docs/10-implementation-spec.md) | API baseline and full-course acceptance criteria. |

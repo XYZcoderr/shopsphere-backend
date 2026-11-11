@@ -4,6 +4,34 @@ This guide is for anyone setting up ShopSphere on a new computer or learning how
 
 ShopSphere is an educational starter, not a complete commerce platform. See [Current scope](#current-scope-and-important-limitations) for the difference between implemented code and planned learning work.
 
+## System map
+
+The runnable local system has two types of processes: Spring Boot services launched from Maven in separate terminals, and infrastructure containers launched by Docker Compose. Compose does **not** run the Spring Boot services.
+
+```mermaid
+flowchart TB
+  Client[Postman / HTTP client]
+  subgraph Host[Applications running on your computer]
+    Gateway[Gateway :8080]
+    Orders[Order Service :8081]
+    Inventory[Inventory Service :8082]
+  end
+  subgraph Compose[Docker Compose containers]
+    PG[(PostgreSQL :5432)]
+    Kafka[(Kafka :9092 on host\n:19092 inside Compose)]
+  end
+  Client -->|/api/orders/**| Gateway
+  Client -->|/api/inventory/**| Gateway
+  Gateway -->|orders route| Orders
+  Gateway -->|inventory route| Inventory
+  Orders -->|JDBC| PG
+  Inventory -->|JDBC| PG
+  Orders -->|OrderCreated, key=orderId| Kafka
+  Kafka -->|consumer group inventory-service| Inventory
+```
+
+Use `localhost:9092` from Spring Boot processes running on your computer. Use `kafka:19092` only from a process running inside the Compose network, such as the Kafka console consumer in the Kafka container. The Gateway is the HTTP front door; Kafka carries an asynchronous event between the order and inventory workflows.
+
 ## 1. What you need
 
 Install these tools before starting:
@@ -127,34 +155,46 @@ Expected response:
 {"sku":"BK-001","available":25}
 ```
 
-Reserve one unit by calling Inventory Service directly:
+`25` is the seed value for a new local database. If you have used this database before, the response shows the current persisted count instead.
+
+Reserve one unit by calling Inventory Service directly. This call bypasses Gateway and changes the durable PostgreSQL stock count:
 
 ```sh
 curl -X POST "http://localhost:8082/api/inventory/BK-001/reserve?quantity=1"
 ```
 
-Create an order through the gateway:
+If you want to see the event itself, start a Kafka console viewer in another terminal before creating the order:
+
+```sh
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:19092 --topic orders.created.v1
+```
+
+Now create an order through the gateway:
 
 ```sh
 curl -X POST http://localhost:8080/api/orders \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: demo-order-001' \
   -d '{"customerId":"customer-123","sku":"BK-001","quantity":1}'
 ```
 
-The response includes an order `id`. Fetch it with:
+Expect `201 Created`; the response's `status` is `PENDING`. Order Service saves the order and starts an asynchronous `OrderCreated` send; it does not wait for Kafka's broker acknowledgement. Inventory Service processes a delivered event independently. Wait for the matching `orderId` and `event=OrderCreated` line in `logs/inventory-service.log` or the Inventory Service terminal before checking the reservation.
+
+Copy the `id` from the create response, then check the order and its reservation through Gateway:
 
 ```sh
 curl http://localhost:8080/api/orders/REPLACE_WITH_ORDER_ID
+curl http://localhost:8080/api/inventory/reservations/REPLACE_WITH_ORDER_ID
+curl http://localhost:8080/api/inventory/BK-001
 ```
 
-Replace `REPLACE_WITH_ORDER_ID` with the ID returned when creating the order. The same sample requests are in [`postman/shopsphere-local.http`](../postman/shopsphere-local.http), which can be opened in an editor that supports HTTP request files.
+The reservation returns `RESERVED` and stock is lower by the order quantity when enough stock exists. For unknown SKUs or insufficient stock, the reservation becomes `REJECTED` and includes its reason. Order status remains `PENDING` because this baseline does not publish the reservation result back to Order Service. A reservation lookup may briefly return `404` before the consumer has created its record; wait for the matching consumer log and retry.
+
+Replace both `REPLACE_WITH_ORDER_ID` values with the ID returned when creating the order. The same sample requests are in the [Postman collection](../postman/shopsphere-local.postman_collection.json) and the simpler [`shopsphere-local.http`](../postman/shopsphere-local.http) request file, which can be opened in an editor that supports HTTP request files.
 
 PowerShell users can call `curl.exe` to avoid the native `curl` alias. To send JSON with PowerShell, use `Invoke-RestMethod`:
 
 ```powershell
 $body = @{ customerId = 'customer-123'; sku = 'BK-001'; quantity = 1 } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri 'http://localhost:8080/api/orders' -ContentType 'application/json' -Headers @{ 'Idempotency-Key' = 'demo-order-001' } -Body $body
 ```
 
 ## 6. Build and run tests
@@ -183,29 +223,49 @@ Default configuration is in each module's `src/main/resources/application.yml` a
 
 | Setting | Default | Used by |
 |---|---|---|
-| PostgreSQL database | `shopsphere` | Order Service and Compose |
-| PostgreSQL username | `shopsphere` | Order Service and Compose |
-| PostgreSQL password | `local_dev_only` | Order Service and Compose |
-| PostgreSQL port | `5432` | Order Service and Compose |
-| Kafka address | `localhost:9092` | Order Service and Inventory Service configuration |
+| `POSTGRES_DB` | `shopsphere` | PostgreSQL container initialization. |
+| `POSTGRES_USER` | `shopsphere` | PostgreSQL container initialization. |
+| `POSTGRES_PASSWORD` | `local_dev_only` | PostgreSQL container initialization, supplied through root `.env` or Compose default. |
+| `DATABASE_URL` | `jdbc:postgresql://localhost:5432/shopsphere` | Order Service and Inventory Service JDBC connections. |
+| `DATABASE_USERNAME` | `shopsphere` | Order Service and Inventory Service JDBC connections. |
+| `DATABASE_PASSWORD` | `local_dev_only` | Order Service and Inventory Service JDBC connections. |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Order Service producer and Inventory Service consumer. |
+| `KAFKA_AUTO_OFFSET_RESET` | `latest` | Inventory Service only; used when consumer group has no saved offset. |
+| `ORDER_SERVICE_URL` | `http://localhost:8081` | Gateway order route destination. |
+| `INVENTORY_SERVICE_URL` | `http://localhost:8082` | Gateway inventory route destination. |
+| `JWT_ISSUER_URI` | empty | Gateway authentication; empty permits local requests without a token. |
 | Gateway port | `8080` | Gateway |
 | Order Service port | `8081` | Order Service and Gateway |
 | Inventory Service port | `8082` | Inventory Service and Gateway |
 
 The repository's `.env.example` is a reference, not an automatically loaded application environment. Compose reads a root `.env` file for variable substitution, but Spring Boot commands launched in a terminal read that terminal's environment. The local defaults work without creating a `.env` file.
 
-To change the PostgreSQL password, create a local `.env` from `.env.example` and set `POSTGRES_PASSWORD` for Compose. Also set `DATABASE_PASSWORD` in the terminal running Order Service so the application matches the database. On macOS or Linux:
+To change the PostgreSQL password, create a local `.env` from `.env.example` and set `POSTGRES_PASSWORD` for Compose. Also set `DATABASE_PASSWORD` in the terminals running **both** Order Service and Inventory Service so each application matches the database. Each Spring Boot app has its own terminal, so export the variable in both terminals before starting the app. On macOS or Linux, use this in the Order Service terminal:
 
 ```sh
 export DATABASE_PASSWORD='your-local-password'
 mvn -f services/order-service/pom.xml spring-boot:run
 ```
 
-In PowerShell:
+Use the same export and the Inventory Service command in its separate terminal:
+
+```sh
+export DATABASE_PASSWORD='your-local-password'
+mvn -f services/inventory-service/pom.xml spring-boot:run
+```
+
+In PowerShell, do the equivalent separately in each service terminal. For Order Service:
 
 ```powershell
 $env:DATABASE_PASSWORD = 'your-local-password'
 mvn -f services/order-service/pom.xml spring-boot:run
+```
+
+For Inventory Service:
+
+```powershell
+$env:DATABASE_PASSWORD = 'your-local-password'
+mvn -f services/inventory-service/pom.xml spring-boot:run
 ```
 
 PostgreSQL applies `POSTGRES_PASSWORD` when it initializes a new data directory. Changing the variable does not change the password inside an existing named volume. If you need to reinitialize that local database, first stop the project and use `docker compose down -v`; this deletes the stored local database and Kafka data.
@@ -257,7 +317,8 @@ shopsphere-backend/
 │   ├── 11-running-and-extending.md        # Setup, run, and extension guide
 │   ├── 12-postman-and-request-tracing.md  # API walkthrough and request tracing
 │   ├── 13-beginner-run-and-postman-guide.md # Beginner setup and API walkthrough
-│   └── 14-project-purpose-concepts-and-production-roadmap.md # Architecture and production gap
+│   ├── 14-project-purpose-concepts-and-production-roadmap.md # Architecture and production gap
+│   └── 15-student-demo-script.md         # Detailed live teaching runbook
 ├── gateway/                              # Spring Cloud Gateway application
 │   ├── pom.xml                            # Dependencies and build settings
 │   └── src/
@@ -267,6 +328,7 @@ shopsphere-backend/
 │       ├── main/resources/application.yml  # Port, routes, optional JWT issuer
 │       └── test/java/...                  # Gateway context test
 ├── postman/
+│   ├── README.md                          # Import instructions and full request map
 │   ├── shopsphere-local.postman_collection.json # Ordered requests and assertions
 │   ├── shopsphere-local.postman_environment.json # Local URLs and sample values
 │   └── shopsphere-local.http              # Example HTTP requests
@@ -275,13 +337,17 @@ shopsphere-backend/
 │   ├── up.sh                              # Starts PostgreSQL and Kafka only
 │   └── down.sh                            # Stops Compose containers
 └── services/
-    ├── inventory-service/                 # Inventory REST API and in-memory stock
+    ├── inventory-service/                 # Inventory REST API, PostgreSQL stock, Kafka consumer
     │   ├── pom.xml
     │   └── src/
     │       ├── main/java/com/shopsphere/inventory/
     │       │   ├── InventoryApplication.java
-    │       │   └── InventoryController.java
-    │       ├── main/resources/application.yml
+    │       │   ├── InventoryController.java
+    │       │   ├── OrderCreatedListener.java
+    │       │   └── RequestLoggingFilter.java
+    │       ├── main/resources/
+    │       │   ├── application.yml
+    │       │   └── schema.sql
     │       └── test/java/.../InventoryControllerTest.java
     └── order-service/                     # Order REST API and Kafka producer
         ├── pom.xml
@@ -301,12 +367,12 @@ Maven creates `target/` folders while building. They contain generated classes a
 ### What the current source files do
 
 - `GatewayApplication.java` starts Spring Cloud Gateway. Its `application.yml` routes `/api/orders/**` to port `8081` and `/api/inventory/**` to port `8082`. `GatewaySecurityConfiguration.java` permits local requests when no issuer is configured; with a trusted JWT issuer, it requires authenticated requests and disables CSRF for this stateless API. `RequestLoggingWebFilter.java` assigns or accepts a safe correlation ID, forwards it downstream, returns it in the response, and logs method, path, status, and duration without logging bodies or credentials. Each service has a `RequestLoggingFilter.java` that logs that same ID as it receives and completes the request.
-- `InventoryApplication.java` starts Inventory Service. `InventoryController.java` exposes stock lookup and reservation endpoints. It stores seeded stock (`BK-001` and `BK-002`) in an in-memory concurrent map, so stock resets on restart and is not shared across instances.
+- `InventoryApplication.java` starts Inventory Service. `InventoryController.java` exposes stock lookup and reservation endpoints. It stores seeded stock and idempotent order reservations in PostgreSQL. A Kafka listener consumes `OrderCreated`; a unique order ID prevents duplicate stock deductions.
 - `OrderApplication.java` starts Order Service. `OrderController.java` validates order requests, reads and writes orders through JDBC, and sends an `OrderCreated` message to Kafka. `schema.sql` creates the order table and a unique index for non-null idempotency keys.
 - Each `pom.xml` declares the application's Spring Boot version, Java target, dependencies, and build plugins. Test source folders hold the current automated tests.
 - `compose.yaml` defines only PostgreSQL and Kafka. Java services run as local Maven processes, not Compose services.
 - `Makefile` provides shortcuts for Compose infrastructure and module tests. `scripts/up.sh` and `scripts/down.sh` start and stop infrastructure; they do not run Java services.
-- `postman/shopsphere-local.postman_collection.json` contains ordered health, inventory, and order workflows with response assertions. Import it with the local environment file, then follow [`docs/12-postman-and-request-tracing.md`](12-postman-and-request-tracing.md). Local service logs are written to `logs/` and ignored by Git.
+- `postman/shopsphere-local.postman_collection.json` contains ordered health, inventory, and order workflows with response assertions. Import it with the local environment file, then follow [`postman/README.md`](../postman/README.md) for the request map and [`docs/12-postman-and-request-tracing.md`](12-postman-and-request-tracing.md) for trace details. Local service logs are written to `logs/` and ignored by Git.
 
 ## 10. Current scope and important limitations
 
@@ -314,10 +380,11 @@ The following boundaries matter when evaluating or extending this code:
 
 - Implemented applications: API Gateway, Order Service, and Inventory Service.
 - Implemented local infrastructure: one PostgreSQL database with a named data volume and one Kafka broker in Compose. Kafka uses container-local storage for this disposable learning setup.
-- Inventory stock is in memory. It is sample data and resets on restart.
+- Order rows, stock, and reservations are persisted in the local PostgreSQL database.
 - Order Service writes an order to PostgreSQL and then sends a Kafka message as two separate operations. A failure between them can leave an order without its event. The code comments identify this as an intentional dual-write teaching flaw; the outbox pattern is an exercise described in `docs/05-resilience-consistency-outbox-saga.md`.
 - An idempotency-key column and unique index exist, but the API does not replay the earlier response when a key is reused. Reusing a key can fail instead of returning the original order.
-- Inventory Service does not consume Kafka events yet. It has a Kafka dependency and broker configuration, but no event consumer or persistent inventory repository.
+- Inventory Service consumes `OrderCreated` events and persists stock and reservations in PostgreSQL.
+- The order remains `PENDING` after inventory processing because a reservation-result event and Order Service status transition are not implemented.
 - Payment, notification, realtime, saga orchestration, webhooks, and a production identity provider are architecture topics or exercises. There are no corresponding runnable services in the current source tree.
 - Actuator exposes health, info, and metrics endpoints locally. The starter does not provide complete production security, tracing, database migration management, or deployment automation.
 
@@ -351,10 +418,10 @@ See [`docs/10-implementation-spec.md`](10-implementation-spec.md) for course acc
 
 For a useful learning progression, consider implementing these in order:
 
-1. Persist inventory in PostgreSQL and make reservations atomic under concurrent requests.
+1. Publish a reservation-result event and update order status after inventory processing.
 2. Implement idempotency-key replay for order creation, including concurrent requests and payload mismatch behavior.
 3. Replace the direct database-plus-Kafka dual write with a transactional outbox and safe publisher.
-4. Add an Inventory Kafka consumer with event deduplication and durable state changes.
+4. Replace the order producer dual write with a transactional outbox, and add retries and dead-letter handling.
 5. Add trusted JWT validation and object-level authorization; test missing, expired, wrong-issuer, and insufficient-scope tokens.
 6. Add integration tests with disposable PostgreSQL and Kafka, then exercise failure and recovery scenarios.
 

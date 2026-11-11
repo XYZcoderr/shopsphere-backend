@@ -17,14 +17,14 @@ The starter makes those ideas visible with three Spring Boot applications and tw
 - The **API Gateway** receives client HTTP requests and routes them to the owning API service.
 - **Order Service** validates and records orders, then publishes an order-created event.
 - **Inventory Service** looks up and reserves sample stock.
-- **PostgreSQL** stores order records.
+- **PostgreSQL** stores order records, stock counts, and reservation outcomes in the local setup.
 - **Kafka** carries order-created events.
 
-The project teaches the trade-offs behind these pieces: service ownership, synchronous HTTP versus asynchronous events, durable versus in-memory data, validation, correlation IDs, consistency, security, testing, and operations. It also includes learning plans for capabilities such as authentication, payments, notifications, WebSockets, webhooks, and sagas; those plans must not be confused with running applications that exist in this starter.
+The project teaches the trade-offs behind these pieces: service ownership, synchronous HTTP versus asynchronous events, durable data, validation, correlation IDs, consistency, security, testing, and operations. It also includes learning plans for capabilities such as authentication, payments, notifications, WebSockets, webhooks, and sagas; those plans must not be confused with running applications that exist in this starter.
 
 ## Current implementation and future architecture
 
-The high-level architecture document includes intended future components. The diagram below separates the implemented flows (solid arrows) from an example future event flow (dashed arrow):
+The first diagram shows the implemented applications and communications. Solid arrows identify the behavior currently in code. Local Compose infrastructure is shared for convenience; logical ownership is still split between Order Service and Inventory Service.
 
 ```mermaid
 flowchart LR
@@ -33,13 +33,56 @@ flowchart LR
   Gateway -->|/api/inventory/**| Inventory[Inventory Service :8082]
   Orders -->|JDBC| Postgres[(PostgreSQL)]
   Orders -->|OrderCreated event| Kafka[(Kafka: orders.created.v1)]
-  Inventory -->|current sample stock| Memory[In-memory map]
-  Kafka -. future consumer exercise .-> Inventory
+  Kafka -->|consume OrderCreated| Inventory
+  Inventory -->|stock and reservations| Postgres
 ```
 
-**Implemented now:** API Gateway, Order Service, Inventory Service, PostgreSQL order storage, Kafka publication from Order Service, health endpoints, request logging, and the local Postman collection.
+The current order-to-inventory sequence, including where the HTTP response returns before inventory work, is:
 
-**Shown as architecture topics or exercises:** inventory persistence and Kafka consumption, payments, notifications, realtime delivery, external webhooks, a production identity provider, a saga, and the transactional outbox. The `docs/01-architecture.md` diagram is a teaching target, not proof that all those components are present in code.
+```mermaid
+sequenceDiagram
+  actor Client as Postman / client
+  participant Gateway as Gateway :8080
+  participant Orders as Order Service :8081
+  participant DB as PostgreSQL
+  participant Kafka as Kafka orders.created.v1
+  participant Inventory as Inventory Service :8082
+  Client->>Gateway: POST /api/orders
+  Gateway->>Orders: Route by /api/orders/**
+  Orders->>DB: INSERT order status=PENDING
+  Orders->>Kafka: start async JSON send keyed by orderId; do not await ack
+  Orders-->>Gateway: 201 Created, status=PENDING
+  Gateway-->>Client: HTTP 201 Created
+  Kafka-->>Inventory: deliver OrderCreated
+  Inventory->>DB: INSERT unique reservation
+  Inventory->>DB: decrement only if SKU exists and stock is enough
+  Client->>Gateway: GET /api/inventory/reservations/{orderId}
+  Gateway->>Inventory: Route by /api/inventory/**
+  Inventory-->>Client: RESERVED or REJECTED
+```
+
+**Implemented now:** API Gateway, Order Service, Inventory Service, PostgreSQL order and inventory storage, Kafka publication and consumption for order reservations, health endpoints, request logging, and the local Postman collection.
+
+**Shown as architecture topics or exercises:** reservation-result events and order-status updates, payments, notifications, realtime delivery, external webhooks, a production identity provider, a saga, and the transactional outbox. The `docs/01-architecture.md` diagram is a teaching target, not proof that all those components are present in code.
+
+The planned reliability improvements fit around the current flow as follows. Dashed nodes and arrows are future work; they are not running components.
+
+```mermaid
+flowchart LR
+  Client[Client] --> GW[Gateway]
+  GW --> OS[Order Service]
+  OS --> DB[(Order database)]
+  OS -. same transaction .-> Outbox[Future transactional outbox]
+  Outbox -. reliable publisher .-> K[Kafka]
+  K --> IS[Inventory Service]
+  IS --> IDB[(Inventory database)]
+  IS -. future reservation result .-> K2[Future reservation-result topic]
+  K2 -. future consumer .-> OS
+  OS -. future lifecycle update .-> DB
+  IS -. failed message .-> DLT[Future dead-letter handling]
+```
+
+This target adds atomic order-and-event intent, explicit inventory result handling, retries, and a dead-letter path. It does not prescribe a single production implementation; requirements and failure guarantees must be decided first.
 
 ## Why each application and dependency exists
 
@@ -47,9 +90,9 @@ flowchart LR
 |---|---|---|---|
 | API Gateway (`gateway/`, port 8080) | Gives a client one entry point and keeps route selection outside business controllers. It is also a place to demonstrate edge authentication and request-level concerns. | Routes `/api/orders/**` to Order Service and `/api/inventory/**` to Inventory Service. It propagates `X-Correlation-ID`, logs request status/time, and can validate JWTs when a trusted issuer is configured. | Local configuration allows unauthenticated calls when `JWT_ISSUER_URI` is empty. No rate limiting, production gateway deployment, or full authorization policy is provided. |
 | Order Service (`services/order-service/`, port 8081) | Owns order creation and retrieval so order rules/data have a clear boundary. | Validates a create request, writes an order row with JDBC to PostgreSQL, publishes an `OrderCreated` event to Kafka, and retrieves an order by ID. | Only create and get-by-ID APIs are implemented. The database write and Kafka publish are separate operations. Idempotency storage exists, but retry replay behavior does not. |
-| Inventory Service (`services/inventory-service/`, port 8082) | Owns stock lookup and reservation behavior independently from the order API. | Reads and updates seeded `BK-001` and `BK-002` counts in a thread-safe in-memory map. Rejects invalid quantities and reports unknown or insufficient stock. | Stock is not durable, and an order does not call or reserve inventory. The service has Kafka configuration/dependency but no event consumer. |
-| PostgreSQL | Demonstrates relational persistence, queries, constraints, and records that survive an application restart. | Stores orders in the `orders` table created from `schema.sql`. | There is no versioned migration workflow, backup procedure, or high-availability database configuration in the starter. |
-| Kafka | Demonstrates asynchronous event publication and the difference between an HTTP response and a message consumed later. | Order Service publishes JSON messages to `orders.created.v1`; a learner can inspect them with a console consumer. | No application consumer currently processes those messages. Broker setup is a single-node local learning configuration. |
+| Inventory Service (`services/inventory-service/`, port 8082) | Owns stock lookup and reservation behavior independently from the order API. | Reads and updates seeded stock in PostgreSQL. Consumes `OrderCreated`, atomically reserves stock, and records a unique reservation per order ID. | Local services share one PostgreSQL instance. Order remains PENDING because reservation results are not published back. |
+| PostgreSQL | Demonstrates relational persistence, queries, constraints, and records that survive an application restart. | Stores orders, stock, and inventory reservations in service-owned tables initialized from each service's `schema.sql`. | Local services share one database instance. There is no versioned migration workflow, backup procedure, or high-availability configuration. |
+| Kafka | Demonstrates asynchronous event publication and the difference between an HTTP response and a message consumed later. | Order Service publishes JSON messages to `orders.created.v1`; Inventory Service consumes them and reserves stock. Learners can inspect messages with a console consumer. | Single-node broker; no transactional outbox or dead-letter topic. |
 | Postman | Provides a visible client for trying API methods and inspecting request/response data without a frontend. | The checked-in collection runs health, inventory, and order examples with assertions. | It is a development/demo tool, not an end-user application or load-testing platform. |
 
 The services run as separate local Maven processes. `compose.yaml` currently runs PostgreSQL and Kafka; it does not containerize the Spring Boot services.
@@ -60,12 +103,12 @@ The services run as separate local Maven processes. `compose.yaml` currently run
 
 1. Postman sends `GET /api/inventory/BK-001` to Gateway on port 8080.
 2. Gateway matches `/api/inventory/**` and forwards the request to Inventory Service on port 8082.
-3. Inventory Service reads the in-memory stock map and returns JSON such as `{"sku":"BK-001","available":25}`.
+3. Inventory Service reads stock from PostgreSQL and returns JSON such as `{"sku":"BK-001","available":25}`.
 4. The same correlation ID appears in Gateway and Inventory Service logs.
 
 ### Inventory reservation
 
-Postman sends `POST /api/inventory/BK-001/reserve?quantity=1` to Inventory Service. A successful call decrements the sample count. A later GET shows the lower count. The count resets when Inventory Service restarts because it exists only in process memory.
+Postman sends `POST /api/inventory/BK-001/reserve?quantity=1` to Inventory Service. A successful call atomically decrements stock in PostgreSQL. A later GET shows the lower count. Order-driven reservations use Kafka instead of synchronous service-to-service HTTP.
 
 ### Order creation
 
@@ -73,13 +116,14 @@ Postman sends `POST /api/inventory/BK-001/reserve?quantity=1` to Inventory Servi
 2. Gateway routes it to Order Service on port 8081 and propagates the correlation ID.
 3. Order Service validates the request, inserts an order row into PostgreSQL, and sends an `OrderCreated` event to Kafka.
 4. It responds with HTTP `201 Created`, including the generated order ID and status `PENDING`.
-5. A later `GET /api/orders/{id}` reads the order from PostgreSQL and returns HTTP `200 OK`.
-
-The API currently does **not** reserve inventory during order creation. There is no implemented orchestration from Order Service to Inventory Service.
+5. Inventory Service consumes the event, conditionally decrements stock, and writes a `RESERVED` or `REJECTED` reservation. A unique order ID makes repeated delivery idempotent.
+6. Call `GET /api/inventory/reservations/{orderId}` through Gateway to inspect the result. Order remains `PENDING`; reservation-result events and status updates are not implemented.
 
 ### Consistency caveat in order creation
 
 The database insert and Kafka send are two separate operations. If one succeeds and the other fails, PostgreSQL and Kafka can disagree. The project intentionally makes this dual-write risk a teaching point; the transactional outbox described in `docs/05-resilience-consistency-outbox-saga.md` is not implemented yet.
+
+Order Service uses `KafkaTemplate.send` asynchronously and does not wait for its future to complete. Therefore an order response can arrive before a broker acknowledgement, and a `201` response alone does not prove that the event is durably present in Kafka. The classroom walkthrough separately checks the Kafka console and Inventory Service consumer log.
 
 ## Concepts the curriculum teaches
 
@@ -91,12 +135,12 @@ The database insert and Kafka send are two separate operations. If one succeeds 
 | Microservice boundary | A service owns focused business behavior and can run separately. | Order Service and Inventory Service are separate applications and ports. |
 | Validation and status codes | Invalid input should be rejected clearly before changing data. | Quantity zero returns `400`; unknown SKU/order returns `404`; creation returns `201`. |
 | Relational persistence | Structured data is stored durably and can be queried later. | Order Service JDBC calls, PostgreSQL, and `schema.sql`. |
-| In-memory versus durable state | Process memory is simple but is lost when that process restarts. | Inventory's sample map resets; order rows remain in PostgreSQL. |
+| In-memory versus durable state | Process memory is simple but is lost when that process restarts. | Order rows, stock, and reservation records persist in PostgreSQL. |
 | Event-driven communication | A service can publish a fact for another component to process asynchronously. | `OrderCreated` on Kafka topic `orders.created.v1`. |
 | Correlation ID and logs | A label lets an operator match log records from one request across processes. | `X-Correlation-ID` response header and `logs/*.log`. |
 | Idempotency | Repeating a request safely should not create duplicate business actions. | A database idempotency-key index exists, while API replay semantics are left as an exercise. |
 | Transactional outbox | Store an outgoing event in the same database transaction as business data, then publish it reliably. | A production exercise; not yet implemented. |
-| Saga and compensation | Coordinate a multi-service business operation through steps and compensating actions. | Future order/inventory/payment flow in the resilience curriculum, not running behavior. |
+| Saga and compensation | Coordinate a multi-service business operation through steps and compensating actions. | Basic order-to-inventory messaging runs today; persistent saga state and compensating actions for a larger checkout are future work. |
 | Authentication and authorization | Authentication identifies a caller; authorization decides what that caller may access. | Gateway can validate JWT issuer configuration. Customer-level access checks are not implemented. |
 | Observability | Logs, metrics, traces, and alerts help explain system behavior and detect failures. | Basic health/info/metrics and correlation-ID logs exist; production observability is incomplete. |
 
@@ -108,9 +152,9 @@ Follow the materials in small steps. First run and observe the starter; then imp
 2. **Run the system:** follow `docs/13-beginner-run-and-postman-guide.md`; verify all three health endpoints.
 3. **Trace requests:** use Postman and the request log files. Match `X-Correlation-ID` between Gateway and the destination service.
 4. **Understand boundaries:** inspect `docs/01-architecture.md`, `docs/02-microservices-gateway-discovery.md`, Gateway routes, and the two service controllers.
-5. **Follow the data:** create an order, retrieve it, query PostgreSQL, then observe the Kafka event. Compare durable order state with temporary inventory state.
-6. **Study event design:** read `docs/04-kafka-events.md`; add a consumer, event versioning, retries, and duplicate handling as exercises.
-7. **Improve correctness:** implement proper idempotency, a transactional outbox, atomic inventory reservations, and eventually a persisted saga. Use `docs/05-resilience-consistency-outbox-saga.md` and the criteria in `docs/10-implementation-spec.md`.
+5. **Follow the data:** create an order, retrieve it, observe the Kafka event, wait for the Inventory Service consumer, inspect the reservation, and query PostgreSQL. Order rows, stock, and reservation records are durable in the local database.
+6. **Study event design:** read `docs/04-kafka-events.md`; extend the existing consumer with versioned event schemas, bounded retry, dead-letter handling, and operational signals.
+7. **Improve correctness:** add idempotency replay, a transactional outbox, reservation-result/order-status handling, and eventually a persisted saga. Basic atomic inventory reservation and order-ID deduplication already exist. Use `docs/05-resilience-consistency-outbox-saga.md` and `docs/10-implementation-spec.md` for criteria.
 8. **Add security:** read `docs/03-auth-jwt-oauth2-oidc.md`; configure a trusted identity provider and enforce object-level authorization in each service.
 9. **Practice operations:** use `docs/07-test-observe-deploy.md` and `docs/08-failure-labs.md` to add tests, metrics, failure handling, and deployment exercises.
 10. **Extend only when justified:** consider whether a capability belongs in an existing service or a new independently owned service. More services bring network, deployment, testing, and data-consistency costs.
@@ -144,11 +188,11 @@ Without these decisions, production sizing and architecture choices would be gue
 ### 3. Durable data and business correctness
 
 - Replace `schema.sql` startup initialization with versioned database migrations and tested roll-forward/rollback procedures.
-- Store inventory in PostgreSQL or another durable data store; implement atomic conditional stock updates and reservation expiry/release.
+- Add reservation expiry/release rules, return stock safely on cancellation, and test atomic inventory updates under concurrency. The starter already stores inventory in PostgreSQL and uses conditional stock updates.
 - Add complete order lifecycle operations, state transition rules, customer ownership checks, and audit history.
 - Implement idempotency-key replay semantics so client retries return the original outcome rather than creating another order or failing unpredictably.
 - Implement the transactional outbox so order state and event intent commit atomically; publish with retries and monitor outbox age.
-- Add consumer deduplication/inbox handling so redelivered events do not repeat business actions.
+- Extend the existing order-ID reservation deduplication with an explicit processed-event/inbox model if event identities and multiple event types are introduced.
 - Define payment authorization/capture/refund and failure handling only after selecting a provider; do not treat a Kafka event alone as proof of payment.
 - If checkout spans orders, inventory, and payment, persist saga state, define timeout behavior, and implement compensating actions.
 
@@ -194,9 +238,9 @@ Without these decisions, production sizing and architecture choices would be gue
 | Applications | Three local Spring Boot processes | Reproducible deployment, resource limits, rollout/rollback, runtime ownership |
 | Authentication | Optional JWT validation at Gateway | Trusted identity configuration plus authorization checks in services |
 | Orders | Create and get-by-ID | Full lifecycle, durable migration, idempotent retries, access control, audit |
-| Inventory | In-memory sample stock | Durable stock, atomic reservation/release, concurrency and recovery tests |
-| Events | Direct OrderCreated publish | Transactional outbox, schema governance, deduplication, retries/DLT, broker HA |
-| Consistency | Dual-write teaching flaw; no order/inventory orchestration | Outbox and, if requirements need it, persisted saga and compensations |
+| Inventory | Durable stock and atomic idempotent reservation | Reservation release/expiry, concurrency and recovery tests |
+| Events | OrderCreated publish and Inventory Service consumer; reservation deduplication uses order ID | Transactional outbox, versioned schema governance, bounded retries/DLT, consumer-lag monitoring, broker HA |
+| Consistency | Order-to-inventory event flow works, but the order/event dual write remains and order stays PENDING | Outbox, reservation-result handling, order state transitions, and (if required) persisted saga and compensations |
 | Observability | Health endpoints and correlation-ID logs | Central logs, traces, metrics, dashboards, alerts, retention, runbooks |
 | Testing | Starter module tests and curriculum plan | Integration, contract, security, failure, load, restore, and release-gate coverage |
 | Infrastructure | Single-node local Compose database and broker | Managed/HA services, secrets, network controls, backup/restore, recovery plan |
@@ -210,8 +254,8 @@ shopsphere-backend/
 ├── gateway/                    # Spring Cloud Gateway application and routes
 ├── services/
 │   ├── order-service/          # Order API, JDBC persistence, Kafka publisher
-│   └── inventory-service/      # Inventory API and sample in-memory stock
-├── postman/                    # Local collection, environment, and HTTP examples
+│   └── inventory-service/      # Inventory API, PostgreSQL stock, Kafka consumer
+├── postman/                    # Local collection, environment, HTTP examples, and usage guide
 ├── scripts/                    # Compose infrastructure start/stop helpers
 ├── docs/                       # Curriculum, architecture, setup, labs, and guides
 ├── compose.yaml                # Local PostgreSQL and Kafka only
